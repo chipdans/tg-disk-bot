@@ -1,8 +1,6 @@
 import asyncio
 from typing import List, Dict, Any
 from datetime import datetime
-from flask import Flask
-from threading import Thread
 import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -188,22 +186,8 @@ async def poll_and_forward(bot: Bot, ydx: YandexDiskClient, db: aiosqlite.Connec
 
             await asyncio.sleep(POLL_INTERVAL)
             
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-def run_web():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run_web)
-    t.start()
-
 
 async def main():
-    keep_alive()
     bot = Bot(token=TG_BOT_TOKEN)
     dp = Dispatcher()
 
