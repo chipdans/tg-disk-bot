@@ -7,9 +7,21 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 import os
 
-TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
-YANDEX_TOKEN = os.environ["YANDEX_TOKEN"]
-TG_CHAT_ID = int(os.environ["TG_CHAT_ID"])
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+YANDEX_TOKEN = os.getenv("YANDEX_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+
+missing = [k for k, v in {
+    "TG_BOT_TOKEN": TG_BOT_TOKEN,
+    "YANDEX_TOKEN": YANDEX_TOKEN,
+    "TG_CHAT_ID": TG_CHAT_ID
+}.items() if not v]
+
+if missing:
+    raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+
+TG_CHAT_ID = int(TG_CHAT_ID)
+
 
 FOLDERS = [
     "/Gvardjd",
