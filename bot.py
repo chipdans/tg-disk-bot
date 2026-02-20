@@ -111,9 +111,11 @@ def parse_iso(iso_date: str) -> Optional[datetime]:
     except Exception:
         return None
 
+from datetime import timedelta
+
 def now_str_local() -> str:
-    # Дата/время подписи: момент отправки (всегда "правильное" для тебя)
-    return datetime.now().strftime("%d.%m.%Y %H:%M")
+    # UTC + 3 часа (МСК)
+    return (datetime.utcnow() + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M")
 
 # =========================
 # Yandex Client
