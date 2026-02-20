@@ -1,12 +1,16 @@
 import asyncio
+import os
 from typing import List, Dict, Any
 from datetime import datetime
+
 import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
-import os
 
+# =========================
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (Railway)
+# =========================
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 YANDEX_TOKEN = os.getenv("YANDEX_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
@@ -22,25 +26,15 @@ if missing:
 
 TG_CHAT_ID = int(TG_CHAT_ID)
 
-
-FOLDERS = [
-    "/Gvardjd",
-    "/palcevolevf",
-    "/Palcevotropa",
-    "/shluz",
-]
-
-POLL_INTERVAL = 30  # секунд между проверками
+# =========================
+# НАСТРОЙКИ
+# =========================
+POLL_INTERVAL = 60  # проверка раз в минуту
+SEND_DELAY_SEC = 0.7
+LAST_LIMIT = 20  # сколько последних файлов проверять
 DB_PATH = "state.db"
 
-# True  -> при первом запуске отметит все текущие фото как "уже отправленные" и не будет спамить старыми
-# False -> отправит ВСЕ фото, которые уже лежат в папках
-SKIP_EXISTING_ON_FIRST_RUN = True
-
-# Пауза между отправками (анти-флуд)
-SEND_DELAY_SEC = 0.6
-# =========================
-
+YANDEX_LAST_UPLOADED = "https://cloud-api.yandex.net/v1/disk/resources/last-uploaded"
 YANDEX_API = "https://cloud-api.yandex.net/v1/disk/resources"
 
 CREATE_TABLE_SQL = """
@@ -50,19 +44,11 @@ CREATE TABLE IF NOT EXISTS sent_files (
 );
 """
 
-CREATE_META_SQL = """
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
-
+# =========================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =========================
 
 def format_date(iso_date: str) -> str:
-    """
-    Преобразует дату из формата Яндекс API (ISO 8601)
-    в формат: 19.02.2026 14:37
-    """
     if not iso_date:
         return ""
     try:
@@ -80,21 +66,22 @@ class YandexDiskClient:
     def headers(self):
         return {"Authorization": f"OAuth {self.token}"}
 
-    async def list_images(self, session: aiohttp.ClientSession, folder_path: str) -> List[Dict[str, Any]]:
+    async def last_uploaded_images(self, session: aiohttp.ClientSession, limit: int = 50) -> List[Dict[str, Any]]:
         params = {
-            "path": folder_path,
-            "limit": 1000,
-            "fields": "_embedded.items.path,_embedded.items.type,_embedded.items.name,_embedded.items.mime_type,_embedded.items.modified"
+            "limit": limit,
+            "fields": "items.path,items.name,items.modified,items.mime_type,items.type"
         }
-        async with session.get(YANDEX_API, headers=self.headers, params=params, timeout=30) as r:
+        async with session.get(YANDEX_LAST_UPLOADED, headers=self.headers, params=params, timeout=30) as r:
             r.raise_for_status()
             data = await r.json()
 
-        items = data.get("_embedded", {}).get("items", [])
+        items = data.get("items", [])
         images = []
+
         for it in items:
             if it.get("type") != "file":
                 continue
+
             name = (it.get("name") or "").lower()
             mime = (it.get("mime_type") or "").lower()
 
@@ -112,23 +99,11 @@ class YandexDiskClient:
         return data["href"]
 
 
-async def init_db(db_path: str) -> aiosqlite.Connection:
-    db = await aiosqlite.connect(db_path)
+async def init_db():
+    db = await aiosqlite.connect(DB_PATH)
     await db.execute(CREATE_TABLE_SQL)
-    await db.execute(CREATE_META_SQL)
     await db.commit()
     return db
-
-
-async def meta_get(db: aiosqlite.Connection, key: str) -> str | None:
-    async with db.execute("SELECT value FROM meta WHERE key=?", (key,)) as cur:
-        row = await cur.fetchone()
-        return row[0] if row else None
-
-
-async def meta_set(db: aiosqlite.Connection, key: str, value: str) -> None:
-    await db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, value))
-    await db.commit()
 
 
 async def is_sent(db: aiosqlite.Connection, path: str) -> bool:
@@ -136,68 +111,54 @@ async def is_sent(db: aiosqlite.Connection, path: str) -> bool:
         return (await cur.fetchone()) is not None
 
 
-async def mark_sent(db: aiosqlite.Connection, path: str, modified: str) -> None:
+async def mark_sent(db: aiosqlite.Connection, path: str, modified: str):
     await db.execute("INSERT OR IGNORE INTO sent_files(path, modified) VALUES(?, ?)", (path, modified))
     await db.commit()
 
 
-async def bootstrap_if_needed(db: aiosqlite.Connection, ydx: YandexDiskClient) -> None:
-    """При первом запуске (если включено) отмечает все текущие фото как 'уже отправленные'."""
-    boot = await meta_get(db, "bootstrapped")
-    if boot == "1":
-        return
-
-    if not SKIP_EXISTING_ON_FIRST_RUN:
-        await meta_set(db, "bootstrapped", "1")
-        return
-
-    print("Первый запуск: пропускаю уже существующие фото (не отправляю старые).")
-    async with aiohttp.ClientSession() as session:
-        for folder in FOLDERS:
-            try:
-                files = await ydx.list_images(session, folder)
-                for f in files:
-                    await mark_sent(db, f["path"], f.get("modified", ""))
-            except Exception as e:
-                print(f"BOOTSTRAP ERROR for {folder}:", repr(e))
-
-    await meta_set(db, "bootstrapped", "1")
-    print("Готово: текущие файлы помечены, дальше будут отправляться только новые.")
-
+# =========================
+# ОСНОВНОЙ ЦИКЛ
+# =========================
 
 async def poll_and_forward(bot: Bot, ydx: YandexDiskClient, db: aiosqlite.Connection):
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                for folder in FOLDERS:
-                    files = await ydx.list_images(session, folder)
+                files = await ydx.last_uploaded_images(session, limit=LAST_LIMIT)
 
-                    for f in files:
-                        path = f["path"]
-                        modified = f.get("modified", "")
+                for f in files:
+                    path = f["path"]
+                    modified = f.get("modified", "")
 
-                        if await is_sent(db, path):
-                            continue
+                    if await is_sent(db, path):
+                        continue
 
-                        download_url = await ydx.get_download_url(session, path)
+                    download_url = await ydx.get_download_url(session, path)
 
-                        date_str = format_date(modified)
-                        caption = (
-                            f"📸 {f.get('name', '')}\n"
-                            f"📁 {folder}\n"
-                            f"📅 {date_str}"
-                        )
+                    caption = (
+                        f"📸 {f.get('name', '')}\n"
+                        f"📁 {path}\n"
+                        f"📅 {format_date(modified)}"
+                    )
 
-                        await bot.send_photo(chat_id=TG_CHAT_ID, photo=download_url, caption=caption)
+                    await bot.send_photo(
+                        chat_id=TG_CHAT_ID,
+                        photo=download_url,
+                        caption=caption
+                    )
 
-                        await mark_sent(db, path, modified)
-                        await asyncio.sleep(SEND_DELAY_SEC)
+                    await mark_sent(db, path, modified)
+                    await asyncio.sleep(SEND_DELAY_SEC)
 
             except Exception as e:
                 print("ERROR:", repr(e))
 
             await asyncio.sleep(POLL_INTERVAL)
-            
+
+
+# =========================
+# ЗАПУСК
+# =========================
 
 async def main():
     bot = Bot(token=TG_BOT_TOKEN)
@@ -207,10 +168,8 @@ async def main():
     async def cmd_id(message: Message):
         await message.answer(f"chat_id = {message.chat.id}")
 
-    db = await init_db(DB_PATH)
+    db = await init_db()
     ydx = YandexDiskClient(YANDEX_TOKEN)
-
-    await bootstrap_if_needed(db, ydx)
 
     asyncio.create_task(poll_and_forward(bot, ydx, db))
 
