@@ -7,6 +7,7 @@ import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
+from aiogram.types import BufferedInputFile
 
 # =========================
 # ENV (Railway)
@@ -31,27 +32,30 @@ TG_CHAT_ID = int(TG_CHAT_ID)
 # =========================
 POLL_INTERVAL = 60
 SEND_DELAY_SEC = 0.7
-LAST_LIMIT = 50
+LAST_LIMIT = 80                 # чуть больше хвост, чтобы не пропускать
 SKIP_EXISTING_ON_START = True
 DB_PATH = "state.db"
+
+# Сколько времени (сек) ждать скачивания файла с Диска
+DOWNLOAD_TIMEOUT = 60
 
 YANDEX_LAST_UPLOADED = "https://cloud-api.yandex.net/v1/disk/resources/last-uploaded"
 YANDEX_API = "https://cloud-api.yandex.net/v1/disk/resources"
 
 # =========================
-# TAGS BY FOLDER
+# TAGS BY FOLDER (ищем по вхождению)
 # =========================
 TAG_BY_FOLDER = {
-    "/palcevolevf": "#Palcevo",
-    "/Gvardjd": "#Gvardeyskiy",
-    "/Palcevotropa": "#Palcevo2",
-    "/shluz": "#Shluz",
+    "/palcevolevf/": "#Palcevo",
+    "/gvardjd/": "#Gvardeyskiy",
+    "/palcevotropa/": "#Palcevo2",
+    "/shluz/": "#Shluz",
 }
 
 def tag_for_path(path: str) -> str:
     p = (path or "").lower()
     for folder, tag in TAG_BY_FOLDER.items():
-        if p.startswith(folder.lower() + "/"):
+        if folder in p:
             return tag
     return "#Photo"
 
@@ -107,11 +111,9 @@ def parse_iso(iso_date: str) -> Optional[datetime]:
     except Exception:
         return None
 
-def format_date(iso_date: str) -> str:
-    dt = parse_iso(iso_date)
-    if not dt:
-        return ""
-    return dt.strftime("%d.%m.%Y %H:%M")
+def now_str_local() -> str:
+    # Дата/время подписи: момент отправки (всегда "правильное" для тебя)
+    return datetime.now().strftime("%d.%m.%Y %H:%M")
 
 # =========================
 # Yandex Client
@@ -124,7 +126,7 @@ class YandexDiskClient:
     def headers(self):
         return {"Authorization": f"OAuth {self.token}"}
 
-    async def last_uploaded_images(self, session: aiohttp.ClientSession, limit: int = 50) -> List[Dict[str, Any]]:
+    async def last_uploaded_images(self, session: aiohttp.ClientSession, limit: int = 80) -> List[Dict[str, Any]]:
         params = {
             "limit": limit,
             "fields": "items.path,items.name,items.modified,items.mime_type,items.type"
@@ -139,10 +141,8 @@ class YandexDiskClient:
         for it in items:
             if it.get("type") != "file":
                 continue
-
             name = (it.get("name") or "").lower()
             mime = (it.get("mime_type") or "").lower()
-
             if mime.startswith("image/") or name.endswith((".jpg", ".jpeg", ".png", ".webp")):
                 images.append(it)
 
@@ -155,6 +155,12 @@ class YandexDiskClient:
             r.raise_for_status()
             data = await r.json()
         return data["href"]
+
+    async def download_bytes(self, session: aiohttp.ClientSession, href: str) -> bytes:
+        # Telegram иногда не может сам скачать по URL, поэтому скачиваем мы и отправляем байтами
+        async with session.get(href, timeout=DOWNLOAD_TIMEOUT) as r:
+            r.raise_for_status()
+            return await r.read()
 
 # =========================
 # Bootstrap (anti-spam)
@@ -180,6 +186,7 @@ async def bootstrap_cursor_if_needed(db: aiosqlite.Connection, ydx: YandexDiskCl
             max_dt = datetime.now(timezone.utc)
 
         await meta_set(db, "cursor_modified", max_dt.isoformat())
+        print(f"BOOTSTRAP: cursor set to {max_dt.isoformat()}")
 
 # =========================
 # MAIN LOOP
@@ -202,18 +209,25 @@ async def poll_and_forward(bot: Bot, ydx: YandexDiskClient, db: aiosqlite.Connec
                     if not dt or dt <= cursor_dt:
                         continue
 
+                    # дубль — пропускаем
                     if await is_sent(db, path):
                         newest_seen = max(newest_seen, dt)
                         continue
 
-                    download_url = await ydx.get_download_url(session, path)
+                    href = await ydx.get_download_url(session, path)
+
+                    # скачиваем байты
+                    data = await ydx.download_bytes(session, href)
 
                     tag = tag_for_path(path)
-                    caption = f"{tag} • {format_date(modified)}"
+                    caption = f"{tag} • {now_str_local()}"  # дата отправки, а не modified
+
+                    filename = f.get("name") or "photo.jpg"
+                    photo = BufferedInputFile(data, filename=filename)
 
                     await bot.send_photo(
                         chat_id=TG_CHAT_ID,
-                        photo=download_url,
+                        photo=photo,
                         caption=caption
                     )
 
